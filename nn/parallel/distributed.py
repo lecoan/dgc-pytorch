@@ -426,7 +426,12 @@ class DistributedDataParallel(Module):
                 raise RuntimeError("DistributedDataParallel only works "
                                    "with gradients that don't require grad")
             bucket = self.buckets[bucket_idx][device_idx]
-            bucket[bucket_offset] = param.grad.data
+            if self.use_dgc:
+                if not self.optim:
+                    raise RuntimeError("use dgc must be set in both ddp and optm")
+                bucket[bucket_offset] = self.optim.get_v_accum(param)
+            else:
+                bucket[bucket_offset] = param.grad.data
             self.buckets_ready_size[bucket_idx][device_idx] += 1
 
             # We can flush these and save memory for replicas
