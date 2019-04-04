@@ -1,0 +1,6 @@
+__pycache__/
+lib/
+.idea/
+.vscode/
+*.py[ci]
+*.so
