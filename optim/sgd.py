@@ -49,7 +49,7 @@ class SGD(Optimizer):
     """
 
     def __init__(self, model, lr=required, momentum=0, dampening=0,
-                 weight_decay=0, nesterov=False,
+                 weight_decay=0, nesterov=False, use_dgc=False,
                  ratio=0.6, reduce_time=False, collect_ratio=0.5):
         if lr is not required and lr < 0.0:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -65,7 +65,9 @@ class SGD(Optimizer):
         self.ratio = ratio
         self.reduce_time = reduce_time
         self.collect_ratio = collect_ratio
-        model.optim = self
+        self.use_dgc = use_dgc
+        if self.use_dgc:
+            model.optim = self
         super(SGD, self).__init__(model.parameters(), defaults)
 
     def __setstate__(self, state):
@@ -94,6 +96,9 @@ class SGD(Optimizer):
                 if p.grad is None:
                     continue
                 d_p = p.grad.data
+                if self.use_dgc:
+                    p.data.add_(-group['lr'], d_p)
+                    continue
                 if weight_decay != 0:
                     d_p.add_(weight_decay, p.data)
                 if momentum != 0:
@@ -163,6 +168,8 @@ class SGD(Optimizer):
             abs_source = source.abs()
 
         top_k = int(abs_source.numel() * self.ratio)
+        if top_k <= 0:
+            return float('inf')
         abs_source.resize_(1, abs_source.numel())  # 原地resize成一行再排序
         abs_source = torch.topk(abs_source, top_k, sorted=True)[0]
         thr = float(abs_source[0, top_k - 1])

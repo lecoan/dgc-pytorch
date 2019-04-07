@@ -182,7 +182,7 @@ class DistributedDataParallel(Module):
     def __init__(self, module, device_ids=None,
                  output_device=None, dim=0, broadcast_buffers=True,
                  process_group=None, bucket_cap_mb=25,
-                 check_reduction=False):
+                 check_reduction=False, use_dgc=False):
 
         super(DistributedDataParallel, self).__init__()
 
@@ -204,6 +204,7 @@ class DistributedDataParallel(Module):
         self.output_device = _get_device_index(output_device, True)
         self.broadcast_buffers = broadcast_buffers
         self.check_reduction = check_reduction
+        self.use_dgc = use_dgc
 
         MB = 1024 * 1024
 
@@ -307,6 +308,7 @@ class DistributedDataParallel(Module):
         self.sized_buckets_no_data = {}
         self.with_data_buckets = {}
         self.bucket_data_size = {}
+        self.param_buckets = param_buckets
         self._register_grad_hooks()
 
     def __getstate__(self):
@@ -459,26 +461,25 @@ class DistributedDataParallel(Module):
 
                 if bucket_idx == self.next_bucket:
                     # Now reduce anything that is ready but not yet reduced
-                    if len(self.ready_buckets_not_reduced) > 0:
+                    if len(self.ready_buckets_not_reduced):
                         send_size(self, bucket, world_size)
 
-                    if len(self.sized_buckets_no_data) > 0:
+                    if len(self.sized_buckets_no_data):
                         send_data(self, world_size)
 
                     if len(self.with_data_buckets):
-                        reduce_data(self)
+                        reduce_data(self, world_size)
 
                 # When all devices' buckets
-                if len(self.ready_buckets_not_reduced):
+                if self.next_bucket == -1:
                     # A final sync for all the reduction works
                     # self._sync_reduction_works()
-                    # TODO: make sure all work finished
-                    self.next_bucket = -1
+                    # make sure all work finished
                     send_data(self, world_size, blocking=True)
-                    reduce_data(self, blocking=True)
+                    reduce_data(self, world_size, blocking=True)
                     self.all_buckets_reduced = True
 
-        def reduce_data(self, blocking=False):
+        def reduce_data(self, world_size, blocking=False):
             sorted_todo = sorted(self.with_data_buckets.keys(), reverse=True)
             for i in sorted_todo:
                 fir_work, sec_work, fir_list, sec_list, size_list = self.with_data_buckets[i]
@@ -498,12 +499,9 @@ class DistributedDataParallel(Module):
                 sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
                 for fir, sec in zip(fir_list, sec_list):
                     sums += RLE.decode((fir, sec), data_size)
-                tensors = unflatten(sums, self.buckets[i][0])
+                tensors = unflatten(sums/world_size, self.buckets[i][0])
                 for idx, tensor in enumerate(tensors):
                     self.bucket[i][0][idx].copy_(tensor)
-
-                if i == self.next_bucket:
-                    self.next_bucket -= 1
 
         def send_data(self, world_size, blocking=False):
             sorted_todo = sorted(self.with_data_buckets.keys(), reverse=True)
@@ -536,7 +534,7 @@ class DistributedDataParallel(Module):
                 # send size
                 self.ready_buckets_not_reduced.remove(bucket_idx)
                 tensors = bucket
-                masks = [self.optim.state[p]["mask"] for p in bucket]
+                masks = [self.optim.state[p]["mask"] for p in self.param_buckets[bucket_idx][0]]
                 grad_line = flatten(tensors)
                 mask_line = flatten(masks)
                 first, second = RLE.encode(grad_line, mask_line)
@@ -546,6 +544,9 @@ class DistributedDataParallel(Module):
                 size = torch.tensor([first.size()[0], second.size()[0]], dtype=torch.int64).cuda()
                 work = dist.all_gather(size_list, size, async_op=True)
                 self.sized_buckets_no_data[bucket_idx] = (work, size_list, first, second)
+
+                if i == self.next_bucket:
+                    self.next_bucket -= 1
 
         return distributed_data_parallel_hook
 
