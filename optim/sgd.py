@@ -50,7 +50,8 @@ class SGD(Optimizer):
 
     def __init__(self, model, lr=required, momentum=0, dampening=0,
                  weight_decay=0, nesterov=False, use_dgc=False,
-                 ratio=0.6, reduce_time=False, collect_ratio=0.5):
+                 ratio=0.99, reduce_time=False, collect_ratio=0.5,
+                 eps=1e-5):
         if lr is not required and lr < 0.0:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if momentum < 0.0:
@@ -66,6 +67,7 @@ class SGD(Optimizer):
         self.reduce_time = reduce_time
         self.collect_ratio = collect_ratio
         self.use_dgc = use_dgc
+        self.eps = eps
         if self.use_dgc:
             model.optim = self
         super(SGD, self).__init__(model.parameters(), defaults)
@@ -140,7 +142,7 @@ class SGD(Optimizer):
             v_accum = param_state["v_accum"]
         v_accum.add_(u_local)
 
-        threshold = self._find_threshold(v_accum)
+        threshold = self._find_threshold(v_accum, param.data())
 
         mask = ((v_accum >= threshold) +
                 (v_accum <= -threshold)) * torch.ones(v_accum.size()).byte().cuda()
@@ -151,26 +153,26 @@ class SGD(Optimizer):
         v_accum.masked_fill_(mask, 0)
         return result
 
-    def _find_threshold(self, source):
+    def _find_threshold(self, grad, weight):
         """
-        对Tensor source执行比例为collect_ratio的随机采样(是否采样根据reduce_time判断)
+        对Tensor grad执行比例为collect_ratio的随机采样(是否采样根据reduce_time判断)
         找到近似绝对值top-ratio的数
-        不改变source
+        不改变grad
         """
         if self.reduce_time:
-            abs_source = source.abs()
-            collect_size = int(source.numel() * self.collect_ratio)
-            abs_source.resize_(abs_source.numel(), 1)
-            perm = torch.randperm(min(589, abs_source.size(0)))
+            abs_grad = grad.abs()
+            collect_size = int(grad.numel() * self.collect_ratio)
+            abs_grad.resize_(abs_grad.numel(), 1)
+            perm = torch.randperm(min(589, abs_grad.size(0)))
             idx = perm[:collect_size]
-            abs_source = abs_source[idx]  # collect_size行1列
+            abs_grad = abs_grad[idx]
         else:
-            abs_source = source.abs()
+            abs_grad = grad.abs()
 
-        top_k = int(abs_source.numel() * self.ratio)
+        top_k = int(abs_grad.numel() * self.ratio)
         if top_k <= 0:
             return float('inf')
-        abs_source.resize_(1, abs_source.numel())  # 原地resize成一行再排序
-        abs_source = torch.topk(abs_source, top_k, sorted=True)[0]
-        thr = float(abs_source[0, top_k - 1])
+        relative_grad = abs_grad / (weight.abs() + self.eps)
+        abs_grad, _ = torch.topk(relative_grad.view(-1), top_k)
+        thr = float(torch.min(abs_grad))
         return thr
