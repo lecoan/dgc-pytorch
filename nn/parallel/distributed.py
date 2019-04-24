@@ -461,26 +461,35 @@ class DistributedDataParallel(Module):
 
                 if bucket_idx == self.next_bucket:
                     # Now reduce anything that is ready but not yet reduced
+                    print(self.ready_buckets_not_reduced)
                     if len(self.ready_buckets_not_reduced):
+                        print("send size {}".format(bucket_idx))
                         send_size(self, bucket, world_size)
 
+                    print(self.sized_buckets_no_data.keys())
                     if len(self.sized_buckets_no_data):
-                        send_data(self, world_size)
+                        print("send data {}".format(bucket_idx))
+                        send_data(self, world_size, blocking=True)
 
+                    print(self.with_data_buckets.keys())
                     if len(self.with_data_buckets):
-                        reduce_data(self, world_size)
+                        print("reduce data {}".format(bucket_idx))
+                        reduce_data(self, world_size, blocking=True)
 
                 # When all devices' buckets
                 if self.next_bucket == -1:
                     # A final sync for all the reduction works
                     # self._sync_reduction_works()
                     # make sure all work finished
+                    print("finally {}".format(bucket_idx))
                     send_data(self, world_size, blocking=True)
                     reduce_data(self, world_size, blocking=True)
                     self.all_buckets_reduced = True
 
         def reduce_data(self, world_size, blocking=False):
             sorted_todo = sorted(self.with_data_buckets.keys(), reverse=True)
+            print("blocking {}".format(blocking))
+            print("reduce todo {}".format(sorted_todo))
             for i in sorted_todo:
                 fir_work, sec_work, fir_list, sec_list, size_list = self.with_data_buckets[i]
                 if not fir_work.is_completed() or not sec_work.is_completed():
@@ -500,11 +509,14 @@ class DistributedDataParallel(Module):
                 for fir, sec in zip(fir_list, sec_list):
                     sums += RLE.decode((fir, sec), data_size)
                 tensors = unflatten(sums / world_size, self.buckets[i][0])
+                print(tensors)
                 for idx, tensor in enumerate(tensors):
                     self.bucket[i][0][idx].copy_(tensor)
 
         def send_data(self, world_size, blocking=False):
             sorted_todo = sorted(self.with_data_buckets.keys(), reverse=True)
+            print("blocking {}".format(blocking))
+            print("data todo {}".format(sorted_todo))
             for i in sorted_todo:
                 work, size_list, first, second = self.sized_buckets_no_data[i]
                 if not work.is_completed():
@@ -527,6 +539,7 @@ class DistributedDataParallel(Module):
 
         def send_size(self, bucket, world_size):
             sorted_todo = sorted(self.ready_buckets_not_reduced, reverse=True)
+            print("size todo {}".format(sorted_todo))
             for i in sorted_todo:
                 # Nothing can be reduced now
                 if i < self.next_bucket:
@@ -592,34 +605,42 @@ def _padding(tensor, length):
 def _unpadding(tensor, length):
     return tensor.narrow(0, 0, length)
 
-# def allreduce(tensors, masks):
-#     # compress bucket tensors
-#     grad_line = flatten(tensors)
-#     mask_line = flatten(masks)
-#     first, second = RLE.encode(grad_line, mask_line)
-#
-#     data_size = grad_line.size()
-#     world_size = dist.get_world_size()
-#
-#     # get compressed tensor size
-#     size_list = [torch.zeros(2, dtype=torch.int64).cuda() for _ in range(world_size)]
-#     size = torch.tensor([first.size()[0], second.size()[0]], dtype=torch.int64).cuda()
-#     work = dist.all_gather(size_list, size, async_op=True)
-#     work.wait()
-#     sizes = torch.stack(size_list)
-#     maxs, _ = torch.max(sizes, dim=0)
-#
-#     # receive bucket compressed tensor
-#     fir_list = [torch.zeros(maxs[0], dtype=first.dtype).cuda() for _ in range(world_size)]
-#     fir_work = dist.all_gather(fir_list, _padding(first, maxs[0]), async_op=True)
-#     sec_list = [torch.zeros(maxs[1], dtype=second.dtype).cuda() for _ in range(world_size)]
-#     sec_work = dist.all_gather(sec_list, _padding(second, maxs[1]), async_op=True)
-#     fir_work.wait()
-#     sec_work.wait()
-#
-#     sums = torch.zeros(data_size).cuda()
-#     fir_list = [_unpadding(fir, size_list[i][0]) for i, fir in enumerate(fir_list)]
-#     sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
-#     for fir, sec in zip(fir_list, sec_list):
-#         sums += RLE.decode((fir, sec), data_size)
-#     return sums
+
+# 不直接使用，作为示例
+def allreduce(tensors, masks):
+    '''
+    加入run-length encode的allreduce实现
+    :param tensors: tensor或者list of tensor, 不要求size相同
+    :param masks:  mask或者list of mask, 不要求size相同
+    :return: 各个节点的tensors的均值
+    '''
+    # compress bucket tensors
+    grad_line = flatten(tensors)
+    mask_line = flatten(masks)
+    first, second = RLE.encode(grad_line, mask_line)
+
+    data_size = grad_line.size()
+    world_size = dist.get_world_size()
+
+    # get compressed tensor size
+    size_list = [torch.zeros(2, dtype=torch.int64).cuda() for _ in range(world_size)]
+    size = torch.tensor([first.size()[0], second.size()[0]], dtype=torch.int64).cuda()
+    work = dist.all_gather(size_list, size, async_op=True)
+    work.wait()
+    sizes = torch.stack(size_list)
+    maxs, _ = torch.max(sizes, dim=0)
+
+    # receive bucket compressed tensor
+    fir_list = [torch.zeros(maxs[0], dtype=first.dtype).cuda() for _ in range(world_size)]
+    fir_work = dist.all_gather(fir_list, _padding(first, maxs[0]), async_op=True)
+    sec_list = [torch.zeros(maxs[1], dtype=second.dtype).cuda() for _ in range(world_size)]
+    sec_work = dist.all_gather(sec_list, _padding(second, maxs[1]), async_op=True)
+    fir_work.wait()
+    sec_work.wait()
+
+    sums = torch.zeros(data_size).cuda()
+    fir_list = [_unpadding(fir, size_list[i][0]) for i, fir in enumerate(fir_list)]
+    sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
+    for fir, sec in zip(fir_list, sec_list):
+        sums += RLE.decode((fir, sec), data_size)
+    return sums
