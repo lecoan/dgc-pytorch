@@ -308,7 +308,7 @@ class DistributedDataParallel(Module):
         self.sized_buckets_no_data = {}
         self.with_data_buckets = {}
         self.bucket_data_size = {}
-        self.param_buckets = param_buckets
+        self.param_buckets = param_buckets[0]
         self._register_grad_hooks()
 
     def __getstate__(self):
@@ -499,7 +499,7 @@ class DistributedDataParallel(Module):
                 sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
                 for fir, sec in zip(fir_list, sec_list):
                     sums += RLE.decode((fir, sec), data_size)
-                tensors = unflatten(sums/world_size, self.buckets[i][0])
+                tensors = unflatten(sums / world_size, self.buckets[i][0])
                 for idx, tensor in enumerate(tensors):
                     self.bucket[i][0][idx].copy_(tensor)
 
@@ -534,7 +534,7 @@ class DistributedDataParallel(Module):
                 # send size
                 self.ready_buckets_not_reduced.remove(bucket_idx)
                 tensors = bucket
-                masks = [self.optim.state[p]["mask"] for p in self.param_buckets[bucket_idx][0]]
+                masks = [self.optim.state[p]["mask"] for p in self.param_buckets[bucket_idx]]
                 grad_line = flatten(tensors)
                 mask_line = flatten(masks)
                 first, second = RLE.encode(grad_line, mask_line)
@@ -591,7 +591,6 @@ def _padding(tensor, length):
 
 def _unpadding(tensor, length):
     return tensor.narrow(0, 0, length)
-
 
 # def allreduce(tensors, masks):
 #     # compress bucket tensors
