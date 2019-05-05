@@ -94,16 +94,19 @@ class SGD(Optimizer):
             momentum = group['momentum']
             dampening = group['dampening']
             nesterov = group['nesterov']
-
+            count = 0
             for p in group['params']:
                 if p.grad is None:
                     continue
                 d_p = p.grad.data
-                if self.use_dgc:
-                    p.data.add_(-group['lr'], d_p)
-                    continue
                 if weight_decay != 0:
                     d_p.add_(weight_decay, p.data)
+                if self.use_dgc:
+                    p.data.add_(-group['lr'], d_p)
+                    # print(count)
+                    # print(d_p.view(-1)[:10])
+                    count += 1
+                    continue
                 if momentum != 0:
                     param_state = self.state[p]
                     if 'momentum_buffer' not in param_state:
@@ -167,13 +170,12 @@ class SGD(Optimizer):
         else:
             abs_grad = grad.abs()
 
-        # NOTE: why don't use 1
         top_k = max(int(abs_grad.numel() * self.ratio), 1)
         if self.relative:
             target_gard = grad.abs() / (weight.abs() + self.eps)
         else:
             target_gard = grad.abs()
         abs_grad, _ = torch.topk(target_gard.view(-1), top_k)
-        threshold = float(torch.min(abs_grad))
-        mask = (target_gard > threshold) * torch.ones(grad.size()).byte().cuda()
+        threshold = torch.min(abs_grad)
+        mask = (target_gard >= threshold) * torch.ones(grad.size()).byte().cuda()
         return mask
