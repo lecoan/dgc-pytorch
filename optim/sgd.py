@@ -50,7 +50,8 @@ class SGD(Optimizer):
 
     def __init__(self, model, lr=required, momentum=0, dampening=0,
                  weight_decay=0, nesterov=False, use_dgc=False,
-                 ratio=0.6, reduce_time=False, collect_ratio=0.5):
+                 reduce_time=False, collect_ratio=0.5,
+                 relative=False, eps=1e-5):
         if lr is not required and lr < 0.0:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if momentum < 0.0:
@@ -62,10 +63,12 @@ class SGD(Optimizer):
                         weight_decay=weight_decay, nesterov=nesterov)
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        self.ratio = ratio
+        self.ratio = None
         self.reduce_time = reduce_time
         self.collect_ratio = collect_ratio
         self.use_dgc = use_dgc
+        self.relative = relative
+        self.eps = eps
         if self.use_dgc:
             model.optim = self
         super(SGD, self).__init__(model.parameters(), defaults)
@@ -91,16 +94,19 @@ class SGD(Optimizer):
             momentum = group['momentum']
             dampening = group['dampening']
             nesterov = group['nesterov']
-
+            count = 0
             for p in group['params']:
                 if p.grad is None:
                     continue
                 d_p = p.grad.data
-                if self.use_dgc:
-                    p.data.add_(-group['lr'], d_p)
-                    continue
                 if weight_decay != 0:
                     d_p.add_(weight_decay, p.data)
+                if self.use_dgc:
+                    p.data.add_(-group['lr'], d_p)
+                    # print(count)
+                    # print(d_p.view(-1)[:10])
+                    count += 1
+                    continue
                 if momentum != 0:
                     param_state = self.state[p]
                     if 'momentum_buffer' not in param_state:
@@ -140,10 +146,7 @@ class SGD(Optimizer):
             v_accum = param_state["v_accum"]
         v_accum.add_(u_local)
 
-        threshold = self._find_threshold(v_accum)
-
-        mask = ((v_accum >= threshold) +
-                (v_accum <= -threshold)) * torch.ones(v_accum.size()).byte().cuda()
+        mask = self._find_mask(v_accum, param.data)
         param_state['mask'] = mask
         not_mask = mask ^ 1
 
@@ -151,26 +154,28 @@ class SGD(Optimizer):
         v_accum.masked_fill_(mask, 0)
         return result
 
-    def _find_threshold(self, source):
+    def _find_mask(self, grad, weight):
         """
-        对Tensor source执行比例为collect_ratio的随机采样(是否采样根据reduce_time判断)
+        对Tensor grad执行比例为collect_ratio的随机采样(是否采样根据reduce_time判断)
         找到近似绝对值top-ratio的数
-        不改变source
+        不改变grad
         """
         if self.reduce_time:
-            abs_source = source.abs()
-            collect_size = int(source.numel() * self.collect_ratio)
-            abs_source.resize_(abs_source.numel(), 1)
-            perm = torch.randperm(min(589, abs_source.size(0)))
+            abs_grad = grad.abs()
+            collect_size = int(grad.numel() * self.collect_ratio)
+            abs_grad.resize_(abs_grad.numel(), 1)
+            perm = torch.randperm(min(589, abs_grad.size(0)))
             idx = perm[:collect_size]
-            abs_source = abs_source[idx]  # collect_size行1列
+            abs_grad = abs_grad[idx]
         else:
-            abs_source = source.abs()
+            abs_grad = grad.abs()
 
-        top_k = int(abs_source.numel() * self.ratio)
-        if top_k <= 0:
-            return float('inf')
-        abs_source.resize_(1, abs_source.numel())  # 原地resize成一行再排序
-        abs_source = torch.topk(abs_source, top_k, sorted=True)[0]
-        thr = float(abs_source[0, top_k - 1])
-        return thr
+        top_k = max(int(abs_grad.numel() * self.ratio), 1)
+        if self.relative:
+            target_gard = grad.abs() / (weight.abs() + self.eps)
+        else:
+            target_gard = grad.abs()
+        abs_grad, _ = torch.topk(target_gard.view(-1), top_k)
+        threshold = torch.min(abs_grad)
+        mask = (target_gard >= threshold) * torch.ones(grad.size()).byte().cuda()
+        return mask

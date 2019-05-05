@@ -303,12 +303,8 @@ class DistributedDataParallel(Module):
         self.all_buckets_reduced = False
         self.check_previous_reduction = False
         self.ready_buckets_not_reduced = set()
-        self.reduction_works = [None for _ in range(len(self.bucket_sizes))]
         self.devs_ready = [0 for _ in range(len(self.bucket_sizes))]
-        self.sized_buckets_no_data = {}
-        self.with_data_buckets = {}
-        self.bucket_data_size = {}
-        self.param_buckets = param_buckets
+        self.param_buckets = param_buckets[0]
         self._register_grad_hooks()
 
     def __getstate__(self):
@@ -432,7 +428,6 @@ class DistributedDataParallel(Module):
         bucket_idx, bucket_offset = self.bucket_map[param]
 
         def distributed_data_parallel_hook(*unused):
-            world_size = dist.get_world_size()
             if param.grad.requires_grad:
                 raise RuntimeError("DistributedDataParallel only works "
                                    "with gradients that don't require grad")
@@ -445,6 +440,12 @@ class DistributedDataParallel(Module):
                 bucket[bucket_offset] = param.grad.data
             self.buckets_ready_size[bucket_idx][device_idx] += 1
 
+            # if param is self.param_buckets[0][0]:
+            #     print(param.view(-1)[:20])
+            #     print('grad')
+            #     print(param.grad.view(-1)[:20])
+            #     print('bucket')
+            #     print(bucket[bucket_offset].view(-1)[:20])
             # We can flush these and save memory for replicas
             if device_idx > 0:
                 param.grad = None
@@ -457,131 +458,67 @@ class DistributedDataParallel(Module):
                     return
 
                 # Now all devices's buckets with index: bucket_idx are ready
-                self.ready_buckets_not_reduced.add(bucket_idx)
-
                 if bucket_idx == self.next_bucket:
-                    # Now reduce anything that is ready but not yet reduced
-                    if len(self.ready_buckets_not_reduced):
-                        send_size(self, bucket, world_size)
+                    masks = [self.optim.state[p]["mask"] for p in self.param_buckets[bucket_idx]]
+                    result = allreduce(bucket, masks)
+                    for p in self.param_buckets[bucket_idx]:
+                        _, offset = self.bucket_map[p]
+                        p.grad.data.copy_(result[offset])
+                    self.next_bucket -= 1
 
-                    if len(self.sized_buckets_no_data):
-                        send_data(self, world_size)
-
-                    if len(self.with_data_buckets):
-                        reduce_data(self, world_size)
+                    if len(self.ready_buckets_not_reduced) > 0:
+                        sorted_todo = sorted(self.ready_buckets_not_reduced, reverse=True)
+                        for i in sorted_todo:
+                            if i < self.next_bucket:
+                                break
+                            tensors = self.buckets[i][0]
+                            masks = [self.optim.state[p]["mask"] for p in self.param_buckets[i]]
+                            result = allreduce(tensors, masks)
+                            for p in self.param_buckets[i]:
+                                _, offset = self.bucket_map[p]
+                                p.grad.data.copy_(result[offset])
+                            self.ready_buckets_not_reduced.remove(i)
+                            if i == self.next_bucket:
+                                self.next_bucket -= 1
+                else:
+                    self.ready_buckets_not_reduced.add(bucket_idx)
 
                 # When all devices' buckets
                 if self.next_bucket == -1:
-                    # A final sync for all the reduction works
-                    # self._sync_reduction_works()
-                    # make sure all work finished
-                    send_data(self, world_size, blocking=True)
-                    reduce_data(self, world_size, blocking=True)
+                    self._reset_status()
                     self.all_buckets_reduced = True
-
-        def reduce_data(self, world_size, blocking=False):
-            sorted_todo = sorted(self.with_data_buckets.keys(), reverse=True)
-            for i in sorted_todo:
-                fir_work, sec_work, fir_list, sec_list, size_list = self.with_data_buckets[i]
-                if not fir_work.is_completed() or not sec_work.is_completed():
-                    if blocking:
-                        fir_work.wait()
-                        sec_work.wait()
-                    else:
-                        continue
-                if i < self.next_bucket:
-                    break
-                # reduce data
-                self.with_data_buckets.pop(i)
-                data_size = self.bucket_data_size[i]
-                sums = torch.zeros(data_size).cuda()
-                fir_list = [_unpadding(fir, size_list[i][0]) for i, fir in enumerate(fir_list)]
-                sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
-                for fir, sec in zip(fir_list, sec_list):
-                    sums += RLE.decode((fir, sec), data_size)
-                tensors = unflatten(sums/world_size, self.buckets[i][0])
-                for idx, tensor in enumerate(tensors):
-                    self.bucket[i][0][idx].copy_(tensor)
-
-        def send_data(self, world_size, blocking=False):
-            sorted_todo = sorted(self.with_data_buckets.keys(), reverse=True)
-            for i in sorted_todo:
-                work, size_list, first, second = self.sized_buckets_no_data[i]
-                if not work.is_completed():
-                    if blocking:
-                        work.wait()
-                    else:
-                        continue
-                if i < self.next_bucket:
-                    break
-                # send data
-                self.sized_buckets_no_data.pop(i)
-                sizes = torch.stack(size_list)
-                maxs, _ = torch.max(sizes, dim=0)
-                # receive bucket compressed tensor
-                fir_list = [torch.zeros(maxs[0], dtype=first.dtype).cuda() for _ in range(world_size)]
-                sec_list = [torch.zeros(maxs[1], dtype=second.dtype).cuda() for _ in range(world_size)]
-                fir_work = dist.all_gather(fir_list, _padding(first, maxs[0]), async_op=True)
-                sec_work = dist.all_gather(sec_list, _padding(second, maxs[1]), async_op=True)
-                self.with_data_buckets[i] = (fir_work, sec_work, fir_list, sec_list, size_list)
-
-        def send_size(self, bucket, world_size):
-            sorted_todo = sorted(self.ready_buckets_not_reduced, reverse=True)
-            for i in sorted_todo:
-                # Nothing can be reduced now
-                if i < self.next_bucket:
-                    break
-                # send size
-                self.ready_buckets_not_reduced.remove(bucket_idx)
-                tensors = bucket
-                masks = [self.optim.state[p]["mask"] for p in self.param_buckets[bucket_idx][0]]
-                grad_line = flatten(tensors)
-                mask_line = flatten(masks)
-                first, second = RLE.encode(grad_line, mask_line)
-
-                self.bucket_data_size[i] = grad_line.size()
-                size_list = [torch.zeros(2, dtype=torch.int64).cuda() for _ in range(world_size)]
-                size = torch.tensor([first.size()[0], second.size()[0]], dtype=torch.int64).cuda()
-                work = dist.all_gather(size_list, size, async_op=True)
-                self.sized_buckets_no_data[bucket_idx] = (work, size_list, first, second)
-
-                if i == self.next_bucket:
-                    self.next_bucket -= 1
 
         return distributed_data_parallel_hook
 
-    def _queue_reduction(self, bucket_idx):
-        # _queue_reduction will use a seperate CUDA stream to coalesce
-        # the small tensors to achieve more parallelisms, before passing the
-        # coalesced tensor into the c10d CUDA stream for reduction
-        result = dist._queue_reduction(self.process_group,
-                                       self.buckets[bucket_idx],
-                                       self.device_ids)
-        self.reduction_works[bucket_idx] = result[0]
-        self.buckets_coalesced[bucket_idx] = result[1]
+    def _reset_status(self):
+        # for i, bucket in enumerate(self.buckets):
+        #     print('bucket')
+        #     print(bucket[0][0].view(-1)[:20])
+        #     print(bucket[0][1].view(-1)[:20])
+        #     print("param")
+        #     print(self.param_buckets[i][0].view(-1)[:20])
+        #     print(self.param_buckets[i][1].view(-1)[:20])
+        #     print('grad')
+        #     print(self.param_buckets[i][0].grad.view(-1)[:20])
+        #     print(self.param_buckets[i][1].grad.view(-1)[:20])
+        #
+        # print('after reduce...')
+        # param = self.param_buckets[0][0]
+        # print(param.view(-1)[:20])
+        # bucket_idx, bucket_offset = self.bucket_map[param]
+        # print('grad')
+        # print(param.grad.data.view(-1)[:20])
+        # print('bucket')
+        # print(self.buckets[bucket_idx][0][bucket_offset].view(-1)[:20])
 
-    def _sync_reduction_works(self):
-        # Now only work on the first GPU of self.device_ids
-        # _sync_reduction will use a seperate CUDA stream to uncoalesce
-        # the coalesced tensors to achieve more parallelisms
-        for bucket_idx, grads_batch in enumerate(self.buckets):
-            dist._sync_reduction(self.reduction_works[bucket_idx],
-                                 grads_batch[0],
-                                 self.buckets_coalesced[bucket_idx])
-
-        # Reset the module states
         self.next_bucket = len(self.bucket_sizes) - 1
         self.ready_buckets_not_reduced = set()
-        self.reduction_works = [None for _ in range(len(self.bucket_sizes))]
         self.devs_ready = [0 for _ in range(len(self.bucket_sizes))]
 
         self.buckets = [[[None for _ in range(self.bucket_sizes[i])]
                          for _ in range(len(self.device_ids))] for i in range(len(self.bucket_sizes))]
         self.buckets_coalesced = [[] for _ in range(len(self.bucket_sizes))]
         self.buckets_ready_size = [[0 for _ in range(len(self.device_ids))] for i in range(len(self.bucket_sizes))]
-        self.sized_buckets_no_data = {}
-        self.with_data_buckets = {}
-        self.bucket_data_size = {}
 
 
 def _padding(tensor, length):
@@ -593,34 +530,56 @@ def _unpadding(tensor, length):
     return tensor.narrow(0, 0, length)
 
 
-# def allreduce(tensors, masks):
-#     # compress bucket tensors
-#     grad_line = flatten(tensors)
-#     mask_line = flatten(masks)
-#     first, second = RLE.encode(grad_line, mask_line)
-#
-#     data_size = grad_line.size()
-#     world_size = dist.get_world_size()
-#
-#     # get compressed tensor size
-#     size_list = [torch.zeros(2, dtype=torch.int64).cuda() for _ in range(world_size)]
-#     size = torch.tensor([first.size()[0], second.size()[0]], dtype=torch.int64).cuda()
-#     work = dist.all_gather(size_list, size, async_op=True)
-#     work.wait()
-#     sizes = torch.stack(size_list)
-#     maxs, _ = torch.max(sizes, dim=0)
-#
-#     # receive bucket compressed tensor
-#     fir_list = [torch.zeros(maxs[0], dtype=first.dtype).cuda() for _ in range(world_size)]
-#     fir_work = dist.all_gather(fir_list, _padding(first, maxs[0]), async_op=True)
-#     sec_list = [torch.zeros(maxs[1], dtype=second.dtype).cuda() for _ in range(world_size)]
-#     sec_work = dist.all_gather(sec_list, _padding(second, maxs[1]), async_op=True)
-#     fir_work.wait()
-#     sec_work.wait()
-#
-#     sums = torch.zeros(data_size).cuda()
-#     fir_list = [_unpadding(fir, size_list[i][0]) for i, fir in enumerate(fir_list)]
-#     sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
-#     for fir, sec in zip(fir_list, sec_list):
-#         sums += RLE.decode((fir, sec), data_size)
-#     return sums
+def allreduce(tensors, masks):
+    '''
+    加入run-length encode的allreduce实现
+    :param tensors: tensor或者list of tensor, 不要求size相同
+    :param masks:  mask或者list of mask, 不要求size相同
+    :return: 各个节点的tensors的均值
+    '''
+    # compress bucket tensors
+    grad_line = flatten(tensors)
+    mask_line = flatten(masks)
+    first, second = RLE.encode(grad_line, mask_line.type(torch.int32))
+    # print('encode count')
+    # print(first)
+    # print('encode symbol')
+    # print(second)
+
+    data_size = grad_line.size()
+    world_size = dist.get_world_size()
+
+    # get compressed tensor size
+    size_list = [torch.zeros(2, dtype=torch.int32).cuda() for _ in range(world_size)]
+    size = torch.tensor([first.size()[0], second.size()[0]], dtype=torch.int32).cuda()
+    dist.all_gather(size_list, size)
+    # print('data size')
+    # print(size_list)
+    sizes = torch.stack(size_list)
+    maxs, _ = torch.max(sizes, dim=0)
+
+    # receive bucket compressed tensor
+    fir_list = [torch.zeros(maxs[0], dtype=first.dtype).cuda() for _ in range(world_size)]
+    # print('before send count')
+    # print(fir_list)
+    # print('padding first')
+    # print(_padding(first, maxs[0]))
+    dist.all_gather(fir_list, _padding(first, maxs[0]))
+    sec_list = [torch.zeros(maxs[1], dtype=second.dtype).cuda() for _ in range(world_size)]
+    dist.all_gather(sec_list, _padding(second, maxs[1]))
+
+    sums = torch.zeros(data_size).cuda()
+    fir_list = [_unpadding(fir, size_list[i][0]) for i, fir in enumerate(fir_list)]
+    sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
+    # print('list data count')
+    # print(fir_list)
+    # print('list data symbol')
+    # print(sec_list)
+    # print('decode sizes: {}'.format(fir_list))
+    for fir, sec in zip(fir_list, sec_list):
+        # print("decode size: {}".format(fir[-1]))
+        # TODO: (fix type convert in cuda)
+        sums += RLE.decode((fir, sec), data_size)
+    result = sums / world_size
+    # print(result[:20])
+    return unflatten(result, tensors)
