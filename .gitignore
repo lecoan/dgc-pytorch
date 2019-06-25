@@ -4,3 +4,4 @@ lib/
 .vscode/
 *.py[ci]
 *.so
+.DS_Store
