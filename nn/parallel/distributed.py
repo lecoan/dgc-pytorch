@@ -18,6 +18,7 @@ from torch._utils import _flatten_dense_tensors as flatten
 from torch._utils import _unflatten_dense_tensors as unflatten
 
 from rle.rle import RLE
+import time
 
 
 class DistributedDataParallel(Module):
@@ -435,7 +436,9 @@ class DistributedDataParallel(Module):
             if self.use_dgc:
                 if not self.optim:
                     raise RuntimeError("use dgc must be set in both ddp and optm")
+                start = time.time()
                 bucket[bucket_offset] = self.optim.get_v_accum(param)
+                print('# get v accum {}'.format(time.time() - start))
             else:
                 bucket[bucket_offset] = param.grad.data
             self.buckets_ready_size[bucket_idx][device_idx] += 1
@@ -538,48 +541,38 @@ def allreduce(tensors, masks):
     :return: 各个节点的tensors的均值
     '''
     # compress bucket tensors
+    start = time.time()
     grad_line = flatten(tensors)
     mask_line = flatten(masks)
     first, second = RLE.encode(grad_line, mask_line.type(torch.int32))
-    # print('encode count')
-    # print(first)
-    # print('encode symbol')
-    # print(second)
+    print('encode takes {}'.format(time.time() - start))
 
     data_size = grad_line.size()
     world_size = dist.get_world_size()
 
     # get compressed tensor size
+    start = time.time()
     size_list = [torch.zeros(2, dtype=torch.int32).cuda() for _ in range(world_size)]
     size = torch.tensor([first.size()[0], second.size()[0]], dtype=torch.int32).cuda()
     dist.all_gather(size_list, size)
-    # print('data size')
-    # print(size_list)
     sizes = torch.stack(size_list)
     maxs, _ = torch.max(sizes, dim=0)
 
     # receive bucket compressed tensor
     fir_list = [torch.zeros(maxs[0], dtype=first.dtype).cuda() for _ in range(world_size)]
-    # print('before send count')
-    # print(fir_list)
-    # print('padding first')
-    # print(_padding(first, maxs[0]))
     dist.all_gather(fir_list, _padding(first, maxs[0]))
     sec_list = [torch.zeros(maxs[1], dtype=second.dtype).cuda() for _ in range(world_size)]
     dist.all_gather(sec_list, _padding(second, maxs[1]))
+    print('all gather takes {}'.format(time.time() - start))
 
+    start = time.time()
     sums = torch.zeros(data_size).cuda()
     fir_list = [_unpadding(fir, size_list[i][0]) for i, fir in enumerate(fir_list)]
     sec_list = [_unpadding(sec, size_list[i][1]) for i, sec in enumerate(sec_list)]
-    # print('list data count')
-    # print(fir_list)
-    # print('list data symbol')
-    # print(sec_list)
-    # print('decode sizes: {}'.format(fir_list))
     for fir, sec in zip(fir_list, sec_list):
-        # print("decode size: {}".format(fir[-1]))
         # TODO: (fix type convert in cuda)
         sums += RLE.decode((fir, sec), data_size)
     result = sums / world_size
+    print('decode takes {}'.format(time.time() - start))
     # print(result[:20])
     return unflatten(result, tensors)
